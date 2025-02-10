@@ -1,0 +1,29 @@
+# 服务器端口号，选填（默认11434）
+port: 11434
+
+# 输入文件路径，包含CIDR格式的IP列表，选填（默认ip.txt）
+inputFile: "ip.txt"
+
+# 输出的CSV文件路径，选填（默认results.csv）
+outputFile: "results.csv"
+
+# 带宽限制（支持K/M单位）
+bandwidth: "100M" 
+
+# 每秒扫描包数
+rate: 10000
+
+# 最大工作线程数，选填（默认CPU核心数*20）
+maxWorkers: 200
+
+# 最大空闲连接数，选填（默认CPU核心数*10）
+maxIdleConns: 100
+
+# 是否禁用性能基准测试，选填（默认false）
+disableBench: false
+
+# 性能测试的提示词，选填（默认"用一句话自我介绍"）
+benchPrompt: "用一句话自我介绍"
+
+# 性能测试的超时时间，选填（默认30s）
+benchTimeout: "30s" 
