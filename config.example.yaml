@@ -1,0 +1,28 @@
+# 基础配置
+# 输入文件路径，包含CIDR格式的IP列表，默认ip.txt
+inputFile: "ip.txt"
+
+# 服务器端口号，默认11434
+port: 11434
+
+# 输出的CSV文件路径，默认results.csv
+outputFile: "results.csv"
+
+# 每秒扫描包数，默认10000
+rate: 10000
+
+# 带宽限制（支持K/M单位），默认100M
+bandwidth: "100M" 
+
+# 超时时间，默认5s
+timeout: "5s"
+
+# 性能测试配置
+# 最大并发数，默认100
+maxWorkers: 100
+
+# 性能测试的提示词，默认"用一句话自我介绍"
+benchPrompt: "用一句话自我介绍"
+
+# 性能测试的超时时间，默认30s
+benchTimeout: "30s" 
