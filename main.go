@@ -67,6 +67,8 @@ var (
 	disableBench    bool          // 是否禁用性能测试
 	benchPrompt     string        // 性能测试提示词
 	portScanOnly    bool          // 是否仅扫描端口
+	rate            int           // 扫描速率
+	bandwidth       string        // 带宽限制
 )
 
 // 全局运行时变量
@@ -98,6 +100,8 @@ func init() {
 	viper.SetDefault("disableBench", false)
 	viper.SetDefault("benchPrompt", "用一句话自我介绍")
 	viper.SetDefault("portScanOnly", false)
+	viper.SetDefault("rate", 10000)
+	viper.SetDefault("bandwidth", "10M")
 
 	// 读取配置文件
 	if err := viper.ReadInConfig(); err != nil {
@@ -122,18 +126,20 @@ func init() {
 func configureSettings() error {
 	fmt.Println("当前配置:")
 	fmt.Printf("1. 扫描端口: %d\n", port)
-	fmt.Printf("2. 网关MAC: %s\n", gatewayMAC)
+	fmt.Printf("2. 网关MAC(可选): %s\n", gatewayMAC)
 	fmt.Printf("3. 输入文件: %s\n", inputFile)
 	fmt.Printf("4. 输出文件: %s\n", outputFile)
 	fmt.Printf("5. 超时时间: %v\n", timeout)
 	fmt.Printf("6. 并发数量: %d\n", maxWorkers)
 	fmt.Printf("7. 性能测试: %v\n", !disableBench)
 	fmt.Printf("8. 仅端口扫描: %v\n", portScanOnly)
+	fmt.Printf("9. 扫描速率: %d/秒\n", rate)
+	fmt.Printf("10. 带宽限制: %s\n", bandwidth)
 	
 	// 创建临时配置
 	newConfig := make(map[string]interface{})
 	
-	fmt.Print("\n请选择要修改的配置项(1-8，回车返回): ")
+	fmt.Print("\n请选择要修改的配置项(1-10，回车返回): ")
 	var choice int
 	fmt.Scanf("%d\n", &choice)
 
@@ -149,6 +155,7 @@ func configureSettings() error {
 			fmt.Print("网关MAC: ")
 			var mac string
 			fmt.Scanf("%s\n", &mac)
+			mac = formatMAC(mac)
 			if mac != "" {
 				newConfig["gatewayMAC"] = mac
 			}
@@ -202,6 +209,20 @@ func configureSettings() error {
 					newConfig["portScanOnly"] = p
 				}
 			}
+		case 9:
+			fmt.Print("扫描速率 (10000): ")
+			var rateStr string
+			fmt.Scanf("%s\n", &rateStr)
+			if r, err := strconv.Atoi(rateStr); err == nil {
+				newConfig["rate"] = r
+			}
+		case 10:
+			fmt.Print("带宽限制 (10M): ")
+			var bw string
+			fmt.Scanf("%s\n", &bw)
+			if bw != "" {
+				newConfig["bandwidth"] = bw
+			}
 		default:
 			return nil
 	}
@@ -236,11 +257,12 @@ func validateAndLoadConfig() error {
 	disableBench = viper.GetBool("disableBench")
 	benchPrompt = viper.GetString("benchPrompt")
 	portScanOnly = viper.GetBool("portScanOnly")
+	rate = viper.GetInt("rate")
+	bandwidth = viper.GetString("bandwidth")
 
 	// 3. 验证必填参数
 	requiredFields := []string{
 		"port",
-		"gatewayMAC",
 	}
 
 	for _, field := range requiredFields {
@@ -255,8 +277,13 @@ func validateAndLoadConfig() error {
 	}
 
 	// 5. 验证MAC地址格式
-	if _, err := net.ParseMAC(gatewayMAC); err != nil {
-		return fmt.Errorf("无效的MAC地址格式: %v", err)
+	if gatewayMAC != "" {
+		if _, err := net.ParseMAC(gatewayMAC); err != nil {
+			return fmt.Errorf("无效的MAC地址格式: %v (正确格式示例：00:11:22:33:44:55)", err)
+		}
+		if !isValidGatewayMAC(gatewayMAC) {
+			return fmt.Errorf("无法找到匹配的网关MAC地址，请使用arp -a命令确认或留空")
+		}
 	}
 
 	// 6. 处理文件路径
@@ -280,7 +307,42 @@ func validateAndLoadConfig() error {
 		return fmt.Errorf("请先在输入文件中添加扫描目标")
 	}
 
+	// 验证速率参数
+	if rate <= 0 {
+		return fmt.Errorf("扫描速率必须大于0，当前值: %d", rate)
+	}
+
+	// 验证带宽格式（简单验证）
+	if !strings.HasSuffix(bandwidth, "M") && !strings.HasSuffix(bandwidth, "K") {
+		return fmt.Errorf("带宽格式不正确，示例：10M 或 100K")
+	}
+
 	return nil
+}
+
+// 新增网关MAC验证函数
+func isValidGatewayMAC(mac string) bool {
+	if mac == "" {
+		return true // 允许为空
+	}
+	iface, err := net.InterfaceByName("eth0") // 根据实际情况调整网卡名称
+	if err != nil {
+		return false
+	}
+	
+	addrs, err := iface.Addrs()
+	if err != nil || len(addrs) == 0 {
+		return false
+	}
+	
+	// 获取网关IP（这里简化处理，实际可能需要更复杂的路由表解析）
+	gatewayIP := strings.Split(addrs[0].String(), "/")[0]
+	gatewayIP = strings.Join(strings.Split(gatewayIP, ".")[:3], ".") + ".1"
+	
+	// 执行arp命令获取真实网关MAC
+	cmd := exec.Command("arp", "-n", gatewayIP)
+	output, _ := cmd.Output()
+	return strings.Contains(string(output), strings.ToLower(mac))
 }
 
 // initHTTPClient 初始化HTTP客户端
@@ -296,6 +358,11 @@ func initHTTPClient() {
 
 // main 程序入口函数
 func main() {
+	// 新增权限检查
+	if os.Geteuid() != 0 {
+		fmt.Println("请使用sudo权限运行本程序")
+		os.Exit(1)
+	}
 	flag.Parse()
 	
 	// 显示帮助信息
@@ -385,7 +452,26 @@ func checkDependencies() error {
 	}
 	fmt.Println("✅ 配置文件正常")
 	
+	// 新增网络接口检查
+	fmt.Println("\n3. 检查网络接口...")
+	if iface := getActiveInterface(); iface != "" {
+		fmt.Printf("✅ 使用网络接口: %s\n", iface)
+	} else {
+		return fmt.Errorf("未找到有效网络接口")
+	}
+	
 	return nil
+}
+
+// getActiveInterface 获取活动网络接口
+func getActiveInterface() string {
+	interfaces, _ := net.Interfaces()
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp != 0 && iface.Flags&net.FlagLoopback == 0 {
+			return iface.Name
+		}
+	}
+	return ""
 }
 
 // startScan 开始扫描
@@ -548,11 +634,23 @@ func runScanProcess(ctx context.Context) error {
 
 // execZmap 执行zmap命令进行网络扫描
 func execZmap() error {
-	cmd := exec.Command("zmap",
+	args := []string{
+		"zmap",
 		"-p", fmt.Sprintf("%d", port),
-		"-G", gatewayMAC,
+		"--rate", fmt.Sprintf("%d", rate),
 		"-w", inputFile,
-		"-o", outputFile)
+		"-o", outputFile,
+		"-B", bandwidth,
+	}
+
+	if gatewayMAC != "" {
+		args = append(args, "--gateway-mac", gatewayMAC)
+	}
+
+	cmd := exec.Command("sudo", args...)
+	
+	fmt.Printf("执行命令: %s\n", strings.Join(cmd.Args, " "))
+	
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
@@ -765,9 +863,7 @@ func getModels(ip string) []string {
 
 	var models []string
 	for _, m := range data.Models {
-		if strings.Contains(m.Model, "deepseek-r1") {
-			models = append(models, m.Model)
-		}
+		models = append(models, m.Model)
 	}
 	
 	return models
@@ -897,4 +993,15 @@ func (p *ProgressBar) display() {
 	if p.current >= p.total {
 		fmt.Println()
 	}
+}
+
+// 新增MAC地址格式化函数
+func formatMAC(input string) string {
+	input = strings.ReplaceAll(input, "-", ":")
+	parts := strings.Split(input, ":")
+	if len(parts) != 6 {
+		return ""
+	}
+	return fmt.Sprintf("%02s:%02s:%02s:%02s:%02s:%02s",
+		parts[0], parts[1], parts[2], parts[3], parts[4], parts[5])
 }
