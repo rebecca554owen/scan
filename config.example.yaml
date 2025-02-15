@@ -1,8 +1,14 @@
 # 服务器端口号，选填（默认11434）
 port: 11434
 
-# 网关的MAC地址，必填
-gatewayMAC: "aa:bb:cc:dd:ee:ff"
+# 网关的MAC地址，可选参数，留空则自动检测 
+gatewayMAC: "" 
+
+# 每秒扫描包数
+rate: 10000      
+
+# 带宽限制（支持K/M单位） 
+bandwidth: "10M" 
 
 # 输入文件路径，包含CIDR格式的IP列表，选填（默认ip.txt）
 inputFile: "ip.txt"
@@ -13,8 +19,8 @@ outputFile: "results.csv"
 # 网络请求的超时时间，选填（默认3s）
 timeout: 3s
 
-# 最大工作线程数，选填（默认200）如果CPU使用率过高，可以降低maxWorkers
-maxWorkers: 200
+# 最大工作线程数，选填（默认100）如果CPU使用率过高，可以降低maxWorkers
+maxWorkers: 100
 
 # 最大空闲连接数，选填（默认100）如果内存占用过大，可以减少maxIdleConns
 maxIdleConns: 100
@@ -33,3 +39,4 @@ benchPrompt: "用一句话自我介绍"
 
 # 是否仅扫描端口（不检测Ollama服务），选填（默认false）
 portScanOnly: false 
+
