@@ -765,9 +765,7 @@ func getModels(ip string) []string {
 
 	var models []string
 	for _, m := range data.Models {
-		if strings.Contains(m.Model, "deepseek-r1") {
-			models = append(models, m.Model)
-		}
+		models = append(models, m.Model)
 	}
 	
 	return models
