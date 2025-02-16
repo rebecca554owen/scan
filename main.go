@@ -16,6 +16,7 @@ import (
 	"net"
 	// 导入viper读取配置
 	"github.com/spf13/viper"
+	"github.com/cheggaaa/pb/v3"
 )
 
 // 配置结构体
@@ -26,29 +27,17 @@ type Config struct {
     OutputFile     string        `mapstructure:"outputFile"`
     Rate           int           `mapstructure:"rate"`
     Bandwidth      string        `mapstructure:"bandwidth"`
-
     // ollama 检测服务相关配置
     MaxWorkers     int           `mapstructure:"maxWorkers"`
     MaxIdleConns   int           `mapstructure:"maxIdleConns"`
     Timeout        time.Duration `mapstructure:"timeout"`
     IdleConnTimeout time.Duration `mapstructure:"idleConnTimeout"`
-
     // ollama 性能测试相关配置
     BenchPrompt    string        `mapstructure:"benchPrompt"`
     BenchTimeout   time.Duration `mapstructure:"benchTimeout"`
-
     // 中间文件配置
     ScanOutputFile   string        `mapstructure:"scanOutputFile"`
     OllamaOutputFile string        `mapstructure:"ollamaOutputFile"`
-}
-
-// 扫描结果结构体
-type ScanResult struct {
-    IP             string
-    Status         string
-    Models         []string
-    FirstTokenDelay time.Duration
-    TokensPerSec    float64
 }
 
 // 扫描器结构体
@@ -59,43 +48,24 @@ type Scanner struct {
     csvFile    *os.File
     outputFile string
     mu         sync.Mutex
+    progress   *pb.ProgressBar
 }
 
 // 初始化方法
-func NewScanner(operation string) (*Scanner, error) {
+func NewScanner() (*Scanner, error) {
     scanner := &Scanner{}
     cfg := scanner.loadConfig()
-    scanner.cfg = cfg // 统一加载配置
+    scanner.cfg = cfg
     
-    // 根据操作类型设置输出文件
-    switch operation {
-    case "scan":
-        scanner.outputFile = cfg.ScanOutputFile
-        return scanner, nil
-    case "detect":
-        scanner.outputFile = cfg.OllamaOutputFile
-    case "benchmark":
-        scanner.outputFile = cfg.OutputFile
-    default:
-        return nil, fmt.Errorf("未知操作类型")
+    // 统一初始化HTTP客户端
+    scanner.httpClient = &http.Client{
+        Timeout: cfg.Timeout,
+        Transport: &http.Transport{
+            MaxIdleConns:    cfg.MaxIdleConns,
+            IdleConnTimeout: cfg.IdleConnTimeout,
+        },
     }
-
-    // 统一创建CSV文件
-    if err := scanner.createCSVFile(operation); err != nil {
-        return nil, err
-    }
-
-    // 按需创建HTTP客户端（仅检测和性能测试需要）
-    if operation != "scan" {
-        scanner.httpClient = &http.Client{
-            Timeout: cfg.Timeout,
-            Transport: &http.Transport{
-                MaxIdleConns:    cfg.MaxIdleConns,
-                IdleConnTimeout: cfg.IdleConnTimeout,
-            },
-        }
-    }
-
+    
     return scanner, nil
 }
 
@@ -112,40 +82,27 @@ func (s *Scanner) loadConfig() *Config {
 	return &cfg
 }
 
-// 资源创建
-func (s *Scanner) createCSVFile(operation string) error {
-    var headers []string
-    switch operation {
-    case "detect":
-        headers = []string{"IP地址", "模型名称"}
-    case "benchmark":
-        headers = []string{"IP地址", "模型名称", "状态", "首Token延迟(ms)", "Tokens/s"}
-    }
-
-    file, err := os.Create(s.outputFile)
-    if err != nil {
-        return fmt.Errorf("创建CSV文件失败: %w", err)
-    }
-
-    writer := csv.NewWriter(file)
-    if err := writer.Write(headers); err != nil {
-        file.Close()
-        return fmt.Errorf("写入表头失败: %w", err)
-    }
-    writer.Flush()
-
-    s.csvFile = file
-    s.csvWriter = writer
-    return nil
-}
-
-// 资源清理
+// 清理资源
 func (s *Scanner) Close() error {
+    var err error
     if s.csvFile != nil {
         s.csvWriter.Flush()
-        return s.csvFile.Close()
+        if closeErr := s.csvFile.Close(); closeErr != nil {
+            err = fmt.Errorf("关闭CSV文件失败: %w", closeErr)
+        }
     }
-    return nil
+    
+    // 关闭HTTP客户端连接池
+    if s.httpClient != nil {
+        s.httpClient.CloseIdleConnections()
+    }
+    
+    // 进度条资源清理
+    if s.progress != nil {
+        s.progress.Finish()
+    }
+    
+    return err
 }
 
 // 扫描IP地址
@@ -164,12 +121,12 @@ func (s *Scanner) ScanIPs() error {
     
     cmd.Stdout = os.Stdout
     cmd.Stderr = os.Stderr
-    
+
     // 执行扫描命令
     if err := cmd.Run(); err != nil {
         return fmt.Errorf("zmap执行失败: %w", err)
     }
-    
+
     return nil
 }
 
@@ -197,6 +154,24 @@ func (s *Scanner) getModels(ip string) []string {
 
 // 服务检测
 func (s *Scanner) DetectOllama() error {
+    s.outputFile = s.cfg.OllamaOutputFile
+    
+    // 直接创建文件并写入表头
+    file, err := os.Create(s.outputFile)
+    if err != nil {
+        return fmt.Errorf("创建CSV文件失败: %w", err)
+    }
+    s.csvFile = file
+    s.csvWriter = csv.NewWriter(s.csvFile)
+    
+    if err := s.csvWriter.Write([]string{"IP地址", "端口", "模型名称"}); err != nil {
+        file.Close()
+        return fmt.Errorf("写入检测表头失败: %w", err)
+    }
+    s.csvWriter.Flush()
+    
+    defer s.Close()
+    
     ipsData, err := os.ReadFile(s.cfg.ScanOutputFile)
     if err != nil {
         return fmt.Errorf("读取IP文件失败: %w", err)
@@ -211,6 +186,11 @@ func (s *Scanner) DetectOllama() error {
     var wg sync.WaitGroup
     var writeMu sync.Mutex
     
+    // 初始化进度条
+    s.progress = pb.New(len(ips))
+    s.progress.SetTemplateString(`{{ "扫描进度:" }} {{counters . }} {{ bar . "[" "=" ">" "." "]" }} {{percent . }}`)
+    s.progress.Start()
+
     for _, ip := range ips {
         ip = strings.TrimSpace(ip)
         if ip == "" {
@@ -224,9 +204,9 @@ func (s *Scanner) DetectOllama() error {
             defer func() {
                 <-workerPool
                 wg.Done()
+                s.progress.Increment()
             }()
 
-            // 直接通过获取模型列表API检测服务
             models := s.getModels(ip)
             if len(models) > 0 {
                 fmt.Printf("✅ 发现可用服务: %s:%d 模型列表: %v\n", 
@@ -242,6 +222,7 @@ func (s *Scanner) DetectOllama() error {
                 for i, model := range models {
                     records[i] = []string{
                         ip,
+                        strconv.Itoa(s.cfg.Port),
                         model,
                     }
                 }
@@ -252,37 +233,69 @@ func (s *Scanner) DetectOllama() error {
     }
     
     wg.Wait()
+    s.progress.Finish()
     return nil
 }
 
 // 性能测试
 func (s *Scanner) BenchmarkOllama() error {
+    s.outputFile = s.cfg.OutputFile
+    
+    // 直接创建文件并写入表头
+    file, err := os.Create(s.outputFile)
+    if err != nil {
+        return fmt.Errorf("创建CSV文件失败: %w", err)
+    }
+    s.csvFile = file
+    s.csvWriter = csv.NewWriter(s.csvFile)
+    
+    if err := s.csvWriter.Write([]string{"IP地址", "端口", "模型名称", "状态", "首Token延迟(ms)", "Tokens/s"}); err != nil {
+        file.Close()
+        return fmt.Errorf("写入测试表头失败: %w", err)
+    }
+    s.csvWriter.Flush()
+    
+    defer s.Close()
+    
     // 读取服务检测结果
-    file, err := os.Open(s.cfg.OllamaOutputFile)
+    data, err := os.ReadFile(s.cfg.OllamaOutputFile)
     if err != nil {
         return fmt.Errorf("读取服务检测结果失败: %w", err)
     }
-    defer file.Close()
+    lines := strings.Split(string(data), "\n")
     
-    reader := csv.NewReader(file)
-    // 跳过CSV头
-    reader.Read()
+    // 计算有效记录数（排除表头和空行）
+    var validRecords int
+    for _, line := range lines {
+        if strings.TrimSpace(line) != "" && !strings.HasPrefix(line, "IP地址") {
+            validRecords++
+        }
+    }
     
+    s.progress = pb.New(validRecords) // 使用实际有效记录数
+    s.progress.SetTemplateString(`{{ "测试进度:" }} {{counters . }} {{ bar . "[" "=" ">" "." "]" }} {{percent . }}`)
+    s.progress.Start()
+
+    // 创建新的reader
+    reader := csv.NewReader(bytes.NewReader(data))
+    reader.Read() // 跳过表头
+
     workerPool := make(chan struct{}, s.cfg.MaxWorkers)
     var wg sync.WaitGroup
     var writeMu sync.Mutex
+
     for {
         record, err := reader.Read()
         if err != nil {
             break
         }
         
-        if len(record) < 4 {
+        if len(record) < 3 {
             fmt.Printf("⚠️ 无效记录: %v\n", record)
             continue
         }
         ip := record[0]
-        modelName := record[3]
+        modelName := record[2]
         
         workerPool <- struct{}{}
         wg.Add(1)
@@ -291,6 +304,7 @@ func (s *Scanner) BenchmarkOllama() error {
             defer func() {
                 <-workerPool
                 wg.Done()
+                s.progress.Increment()
             }()
             if net.ParseIP(ip) == nil || modelName == "" {
                 return
@@ -316,6 +330,7 @@ func (s *Scanner) BenchmarkOllama() error {
                 
                 s.csvWriter.Write([]string{
                     ip,
+                    strconv.Itoa(s.cfg.Port),
                     modelName,
                     "连接失败",
                     "0",
@@ -330,6 +345,7 @@ func (s *Scanner) BenchmarkOllama() error {
                 
                 s.csvWriter.Write([]string{
                     ip,
+                    strconv.Itoa(s.cfg.Port),
                     modelName,
                     fmt.Sprintf("HTTP %d", resp.StatusCode),
                     "0",
@@ -338,7 +354,7 @@ func (s *Scanner) BenchmarkOllama() error {
                 resp.Body.Close()
                 return
             }
-
+            
             scanner := bufio.NewScanner(resp.Body)
             var (
                 firstToken time.Time
@@ -370,6 +386,7 @@ func (s *Scanner) BenchmarkOllama() error {
                 
                 s.csvWriter.Write([]string{
                     ip,
+                    strconv.Itoa(s.cfg.Port),
                     modelName,
                     "无响应",
                     "0",
@@ -387,6 +404,7 @@ func (s *Scanner) BenchmarkOllama() error {
             
             s.csvWriter.Write([]string{
                 ip,
+                strconv.Itoa(s.cfg.Port),
                 modelName,
                 "成功",
                 strconv.FormatInt(latency.Milliseconds(), 10),
@@ -403,11 +421,19 @@ func (s *Scanner) BenchmarkOllama() error {
     }
     
     wg.Wait()
+    s.progress.Finish()
     return nil
 }
 
 // 主函数
 func main() {
+    scanner, err := NewScanner() // 初始化通用扫描器
+    if err != nil {
+        fmt.Printf("初始化失败: %v\n", err)
+        return
+    }
+    defer scanner.Close()
+
     for {
         fmt.Println("\n请选择操作:")
         fmt.Println("1. 端口扫描")
@@ -421,41 +447,17 @@ func main() {
         
         switch choice {
         case 1:
-            scanner, err := NewScanner("scan")
-            if err != nil {
-                fmt.Printf("❌ 初始化失败: %v\n", err)
-                continue
-            }
             if err := scanner.ScanIPs(); err != nil {
-                fmt.Printf("❌ IP扫描失败: %v\n", err)
                 continue
             }
-            fmt.Printf("✅ IP扫描完成，结果已保存至 %s\n", scanner.cfg.ScanOutputFile)
-            
         case 2:
-            scanner, err := NewScanner("detect")
-            if err != nil {
-                fmt.Printf("❌ 初始化失败: %v\n", err)
-                continue
-            }
             if err := scanner.DetectOllama(); err != nil {
-                fmt.Printf("❌ Ollama服务检测失败: %v\n", err)
                 continue
             }
-            fmt.Printf("✅ 服务检测完成，结果已保存至 %s\n", scanner.cfg.OllamaOutputFile)
-            
         case 3:
-            scanner, err := NewScanner("benchmark")
-            if err != nil {
-                fmt.Printf("❌ 初始化失败: %v\n", err)
-                continue
-            }
             if err := scanner.BenchmarkOllama(); err != nil {
-                fmt.Printf("❌ 性能测试失败: %v\n", err)
                 continue
             }
-            fmt.Printf("✅ 性能测试完成，结果已保存至 %s\n", scanner.cfg.OutputFile)
-            
         case 0:
             fmt.Println("👋 再见!")
             return
